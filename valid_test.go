@@ -3,16 +3,14 @@ package valid
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"testing"
 )
 
 type testAAA struct{}
 
-func (t testAAA) Validate(value any) (*Violation, error) {
-	return &Violation{
-		Value: value,
-		Msg:   "aaa",
-	}, nil
+func (t testAAA) Validate(value reflect.Value) (string, error) {
+	return "aaa", nil
 }
 
 func (t testAAA) Msg(message string) Rule {
@@ -21,7 +19,7 @@ func (t testAAA) Msg(message string) Rule {
 
 func TestCheck(t *testing.T) {
 	type test2Struct struct {
-		WWW string `validate:"abc"`
+		WWW string `validate:"required,min=3,(max=4,len=3)"`
 	}
 	type testStruct struct {
 		Abc string        `validate:"abc"`

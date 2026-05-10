@@ -11,26 +11,20 @@ const (
 	tagSeparator = ","
 )
 
-type ViolationError struct {
-	Path  string `json:"path"`
-	Rule  string `json:"rule"`
-	Value any    `json:"value,omitempty"`
-	Msg   string `json:"msg"`
+type Violation struct {
+	Path string `json:"path"`
+	Rule string `json:"rule"`
+	Msg  string `json:"msg"`
 }
 
 // TODO: Temporary body
-func (e ViolationError) Error() string {
+func (e Violation) Error() string {
 	return fmt.Sprintf("%s: %s", e.Path, e.Msg)
 }
 
-type Violation struct {
-	Value any
-	Msg   string
-}
+type Violations []Violation
 
-type ValidationErrors []ViolationError
-
-func (e ValidationErrors) Error() string {
+func (e Violations) Error() string {
 	errStrings := make([]string, 0, len(e))
 	for _, err := range e {
 		errStrings = append(errStrings, err.Error())
@@ -40,7 +34,7 @@ func (e ValidationErrors) Error() string {
 }
 
 type Rule interface {
-	Validate(value any) (*Violation, error)
+	Validate(value reflect.Value) (string, error)
 	Msg(message string) Rule
 }
 
@@ -75,103 +69,137 @@ func (v *Validator) Check(value any) error {
 	return validationErrors
 }
 
-// TODO: Think of a better name
-func (v *Validator) validateStruct(rt reflect.Type, rv reflect.Value, path string) (ValidationErrors, error) {
-	var validationErrors ValidationErrors
+func (v *Validator) validateStruct(rt reflect.Type, rv reflect.Value, path string) (Violations, error) {
+	var violations Violations
 
 	for i := 0; i < rt.NumField(); i++ {
 		fieldType := rt.Field(i)
 		fieldValue := rv.Field(i)
 
-		tag := fieldType.Tag.Get(tagName)
-		if tag == "" {
-			return nil, fmt.Errorf("field %s has an empty tag", fieldType.Name)
+		fieldViolations, err := v.validateField(fieldType, fieldValue, path)
+		if err != nil {
+			return nil, err
 		}
 
-		fieldValidationErrors, err := v.validateFieldRules(
-			fieldValue.Interface(),
-			formatPath(path, fieldType.Name),
-			strings.Split(tag, tagSeparator),
+		violations = append(violations, fieldViolations...)
+	}
+
+	return violations, nil
+}
+
+func (v *Validator) validateField(
+	fieldType reflect.StructField,
+	fieldValue reflect.Value,
+	path string,
+) (Violations, error) {
+	if !fieldType.IsExported() {
+		return nil, nil
+	}
+
+	violations, err := v.validateFieldRules(
+		fieldValue,
+		formatPath(path, fieldType.Name),
+		strings.Split(fieldType.Tag.Get(tagName), tagSeparator),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	nestedViolations, err := v.validateNested(fieldType, fieldValue, path)
+	if err != nil {
+		return nil, err
+	}
+
+	violations = append(violations, nestedViolations...)
+
+	return violations, nil
+}
+
+func (v *Validator) validateFieldRules(value reflect.Value, path string, rules []string) (Violations, error) {
+	var violations Violations
+
+	for _, ruleName := range rules {
+		rule, ok := v.Rules[ruleName]
+		if !ok {
+			return nil, fmt.Errorf("rule \"%s\" isn't defined | field path: %s", ruleName, path)
+		}
+
+		violationMsg, err := rule.Validate(value)
+		if err != nil {
+			return nil, err
+		}
+
+		if violationMsg == "" {
+			continue
+		}
+
+		violations = append(violations, Violation{
+			Path: path,
+			Rule: ruleName,
+			Msg:  violationMsg,
+		})
+	}
+
+	return violations, nil
+}
+
+func (v *Validator) validateNested(
+	fieldType reflect.StructField,
+	fieldValue reflect.Value,
+	path string,
+) (Violations, error) {
+	value := deref(fieldValue)
+
+	switch value.Kind() {
+	case reflect.Struct:
+		return v.validateStruct(value.Type(), value, formatPath(path, fieldType.Name))
+
+	case reflect.Slice:
+		return v.validateSlice(fieldType, value, path)
+
+	default:
+		return nil, nil
+	}
+}
+
+func (v *Validator) validateSlice(
+	fieldType reflect.StructField,
+	val reflect.Value,
+	path string,
+) (Violations, error) {
+	elemType := val.Type().Elem()
+
+	if elemType.Kind() == reflect.Ptr {
+		elemType = elemType.Elem()
+	}
+
+	if elemType.Kind() != reflect.Struct {
+		return nil, nil
+	}
+
+	var violations Violations
+
+	for i := 0; i < val.Len(); i++ {
+		elem := val.Index(i)
+		elem = deref(elem)
+
+		if elem.Kind() != reflect.Struct {
+			continue
+		}
+
+		elemViolations, err := v.validateStruct(
+			elem.Type(),
+			elem,
+			fmt.Sprintf("%s[%d]", formatPath(path, fieldType.Name), i),
 		)
 		if err != nil {
 			return nil, err
 		}
 
-		validationErrors = append(validationErrors, fieldValidationErrors...)
-
-		fv := fieldValue
-		if fv.Kind() == reflect.Ptr {
-			fv = fv.Elem()
-		}
-
-		switch fv.Kind() {
-		case reflect.Struct:
-			validationErrs, err := v.validateStruct(fv.Type(), fv, formatPath(path, fieldType.Name))
-			if err != nil {
-				return nil, err
-			}
-
-			validationErrors = append(validationErrors, validationErrs...)
-
-		case reflect.Slice:
-			for j := 0; j < fv.Len(); j++ {
-				elemValue := fv.Index(j)
-
-				if elemValue.Kind() == reflect.Ptr {
-					if elemValue.IsNil() {
-						continue
-					}
-					elemValue = elemValue.Elem()
-				}
-
-				if elemValue.Kind() != reflect.Struct {
-					continue
-				}
-
-				validationErrs, err := v.validateStruct(
-					elemValue.Type(),
-					elemValue,
-					fmt.Sprintf("%s[%d]", formatPath(path, fieldType.Name), j),
-				)
-				if err != nil {
-					return nil, err
-				}
-
-				validationErrors = append(validationErrors, validationErrs...)
-			}
-		}
+		violations = append(violations, elemViolations...)
 	}
 
-	return validationErrors, nil
-}
-
-func (v *Validator) validateFieldRules(value any, path string, rules []string) (ValidationErrors, error) {
-	var validationErrors ValidationErrors
-
-	for _, ruleName := range rules {
-		rule, ok := v.Rules[ruleName]
-		if !ok {
-			return nil, fmt.Errorf("rule %s doesn't exist", ruleName)
-		}
-
-		violation, err := rule.Validate(value)
-		if err != nil {
-			return nil, err
-		}
-
-		if violation == nil {
-			continue
-		}
-
-		validationErrors = append(validationErrors, ViolationError{
-			Path:  path,
-			Rule:  ruleName,
-			Value: violation.Value,
-			Msg:   violation.Msg,
-		})
-	}
-
-	return validationErrors, nil
+	return violations, nil
 }
 
 var validator = New()
@@ -186,4 +214,14 @@ func formatPath(parent, child string) string {
 	}
 
 	return fmt.Sprintf("%s.%s", parent, child)
+}
+
+func deref(v reflect.Value) reflect.Value {
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
+		v = v.Elem()
+	}
+	return v
 }
